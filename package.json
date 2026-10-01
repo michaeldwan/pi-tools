@@ -1,0 +1,46 @@
+{
+  "name": "@michaeldwan/pi-tools",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Pi extensions and skills, including RPC subagents.",
+  "author": "Michael Dwan",
+  "license": "MIT",
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "extensions",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/subagents/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "pnpm@11.17.0",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*/*.test.ts",
+    "check": "pnpm run typecheck && pnpm run test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.99.1",
+    "@earendil-works/pi-tui": "0.99.1",
+    "@types/node": "^22.0.0",
+    "typebox": "1.1.38",
+    "typescript": "~5.9.3"
+  }
+}

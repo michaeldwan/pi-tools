@@ -1,0 +1,220 @@
+import { getAgentDir, ProjectTrustStore, type ExtensionAPI, type AgentToolResult } from "@earendil-works/pi-coding-agent";
+import { isAbsolute } from "node:path";
+import { realpathSync } from "node:fs";
+import { Type } from "typebox";
+import { discoverAgents, resolveModel, thinkingLevels, type Thinking } from "./agents.ts";
+import { childConfigKey } from "./guard.ts";
+import { piInvocation } from "./rpc.ts";
+import { Worker, type WorkerResult } from "./worker.ts";
+import { Registry } from "./registry.ts";
+import { registerSubagentsUI } from "./overlay.ts";
+
+const resultSchema = Type.Object({
+  id: Type.String(), attempt: Type.Number(), status: Type.Union(["starting", "running", "completed", "failed", "stopped", "interrupted"].map((status) => Type.Literal(status))),
+  cwd: Type.String(), model: Type.String(), thinking: Type.String(), pid: Type.Optional(Type.Number()),
+  sessionFile: Type.Optional(Type.String()), transcript: Type.String(), preflight: Type.String(), resultPath: Type.String(),
+  text: Type.String(), truncated: Type.Boolean(), error: Type.Optional(Type.String()), stopReason: Type.Optional(Type.String()),
+  usage: Type.Object({ input: Type.Number(), output: Type.Number(), cacheRead: Type.Number(), cacheWrite: Type.Number(), totalTokens: Type.Number(),
+    cost: Type.Object({ input: Type.Number(), output: Type.Number(), cacheRead: Type.Number(), cacheWrite: Type.Number(), total: Type.Number() }) }),
+  stats: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+});
+
+export function resultText(result: WorkerResult) {
+  return `Worker ${result.id}: ${result.status}${result.error ? `\n${result.error}` : ""}` +
+    `${result.text ? `\n\n${result.text}` : ""}${result.truncated ? "\n[Output truncated]" : ""}` +
+    `\n\nWorker transcript: ${result.transcript}\nSession: ${result.sessionFile ?? "not created"}\nResult: ${result.resultPath}`;
+}
+
+async function wait(worker: Worker, timeoutMs: number, signal?: AbortSignal) {
+  signal?.throwIfAborted();
+  let timer: NodeJS.Timeout | undefined;
+  let abort = () => {};
+  try {
+    await Promise.race([worker.done, new Promise<void>((resolve, reject) => {
+      timer = setTimeout(resolve, timeoutMs);
+      abort = () => reject(new Error("Result wait aborted; worker continues. Use stop_subagent to cancel it."));
+      signal?.addEventListener("abort", abort, { once: true });
+    })]);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+  }
+}
+
+export default function subagents(pi: ExtensionAPI) {
+  if (process.env[childConfigKey]) return;
+  const usageEntry = "pi-rpc-subagent-usage";
+  let registry: Registry | undefined;
+  let quitting = false;
+  registerSubagentsUI(pi, () => registry);
+  pi.on("session_start", (event, ctx) => {
+    quitting = false;
+    const opened = Registry.open(getAgentDir(), ctx.sessionManager.getSessionId(), piInvocation(), ctx.sessionManager.getSessionFile());
+    registry = opened.registry;
+    // Disk markers can precede delivery. The parent's raw persisted entries
+    // decide what was received, including history removed from model context.
+    const entries = ctx.sessionManager.getEntries();
+    const committed = new Set(entries.filter((entry) => entry.type === "message" &&
+      entry.message.role === "toolResult" && entry.message.usage).map((entry) =>
+      (entry as { message: { toolCallId: string } }).message.toolCallId));
+    for (const worker of registry.workers.values()) {
+      let notifiedAttempt = 0;
+      let reportedUsage: WorkerResult["usage"] | undefined;
+      for (const entry of entries) {
+        if (entry.type === "custom_message" && entry.customType === "pi-rpc-subagent-completion") {
+          const detail = entry.details as WorkerResult | undefined;
+          if (detail?.id === worker.id) notifiedAttempt = Math.max(notifiedAttempt, detail.attempt);
+        }
+        if (entry.type === "custom" && entry.customType === usageEntry) {
+          const ledger = entry.data as { id: string; callId: string; total: WorkerResult["usage"] };
+          if (ledger.id === worker.id && committed.has(ledger.callId)) reportedUsage = ledger.total;
+        }
+        // Also recognize directly persisted tool results from earlier loads.
+        if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
+          const detail = entry.message.details as WorkerResult | undefined;
+          if (detail?.id === worker.id) reportedUsage = detail.usage;
+        }
+      }
+      // Reload keeps the live parent's follow-up queue and pending tool results.
+      // Only disk recovery must roll back markers not committed to its transcript.
+      const keepLive = event.reason === "reload" && opened.live;
+      worker.reconcile(keepLive ? Math.max(notifiedAttempt, worker.notifiedAttempt) : notifiedAttempt,
+        keepLive ? worker.reportedUsage : reportedUsage);
+    }
+    registry.changed = (worker) => {
+      const active = [...registry!.workers.values()].filter((item) => !item.terminal).length;
+      ctx.ui.setStatus("pi-rpc-subagents", active ? `${active} worker${active === 1 ? "" : "s"} active` : undefined);
+      if (!worker.terminal || !worker.background || worker.notifiedAttempt >= worker.snapshot().attempt) return;
+      worker.notifiedAttempt = worker.snapshot().attempt;
+      worker.save();
+      const snapshot = worker.snapshot();
+      pi.sendMessage({ customType: "pi-rpc-subagent-completion", content: resultText(snapshot), display: true,
+        details: snapshot }, { deliverAs: "followUp", triggerTurn: true });
+    };
+    for (const worker of registry.workers.values()) registry.changed(worker);
+  });
+  const lookup = (id: string) => {
+    const worker = registry?.workers.get(id);
+    if (!worker) throw new Error(`Unknown worker ${id}. Use the ID returned by subagent in this parent session.`);
+    return worker;
+  };
+  const result = (worker: Worker, callId: string) => {
+    const snapshot = worker.snapshot();
+    const usage = worker.takeUsage();
+    if (usage) pi.appendEntry(usageEntry, { id: worker.id, callId: callId.split("/")[0], total: worker.reportedUsage });
+    return { content: [{ type: "text" as const, text: resultText(snapshot) }], details: snapshot,
+      structuredContent: snapshot, isError: ["failed", "stopped", "interrupted"].includes(snapshot.status), usage };
+  };
+  pi.on("session_shutdown", async (event) => {
+    registry?.detach();
+    if (event.reason === "reload") return;
+    quitting = true;
+    await registry?.close(event.reason === "quit" ? "Parent session quit" : `Parent session replaced (${event.reason})`);
+    registry = undefined;
+  });
+  pi.registerTool({
+    name: "subagent", label: "Subagent",
+    description: "Start one fresh pi RPC worker in an explicit absolute cwd. background:true returns a stable ID before startup completes; " +
+      "otherwise waits for settlement. Workers run independently. Inherits provider/model and thinking unless overridden. " +
+      "Loads normal child resources, blocks recursive delegation and checks required tools before work. " +
+      "Default agent: general-purpose; read-only defaults: Explore and Plan. resume:<worker ID> explicitly continues the same " +
+      "persisted conversation after settlement, stop or interruption. Resume retains cwd, agent, model, thinking and restrictions unless " +
+      "explicitly overridden; it can't change cwd/agent, broaden tool restrictions or overlap an active attempt.",
+    parameters: Type.Object({
+      task: Type.String({ minLength: 1 }),
+      resume: Type.Optional(Type.String({ description: "Worker ID to resume in its original persisted session" })),
+      cwd: Type.String({ description: "Explicit absolute worker directory" }),
+      background: Type.Optional(Type.Boolean({ default: false })),
+      agent: Type.Optional(Type.String()),
+      model: Type.Optional(Type.String({ description: "Exact provider/model or model ID" })),
+      thinking: Type.Optional(Type.Union(thinkingLevels.map((level) => Type.Literal(level)))),
+      tools: Type.Optional(Type.Array(Type.String(), { description: "Exact allowlist, including nested MCP calls" })),
+      requiredTools: Type.Optional(Type.Array(Type.String(), { description: "Exact tool names required before work starts" })),
+      approveProject: Type.Optional(Type.Boolean({ description: "Trust this cwd's project resources for this child process" })),
+      startupTimeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 120_000, default: 20_000 })),
+      runTimeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 86_400_000, default: 600_000,
+        description: "Hard settlement deadline; stalled work fails and its process is closed" })),
+    }),
+    outputSchema: resultSchema,
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (quitting || !registry) throw new Error("Parent worker registry isn't available; can't launch workers");
+      signal?.throwIfAborted();
+      if (!isAbsolute(params.cwd)) throw new Error("subagent cwd must be an explicit absolute directory");
+      if (params.resume) {
+        const worker = lookup(params.resume);
+        const snapshot = worker.snapshot();
+        if (realpathSync(params.cwd) !== snapshot.cwd) throw new Error("Resume can't change the worker's cwd");
+        if (params.agent) throw new Error("Resume retains its saved agent; omit agent");
+        const defaults = worker.resumeDefaults();
+        const selected = resolveModel(defaults.model, defaults.thinking, { name: "saved", prompt: "" }, params.model, params.thinking);
+        const overrides = { cwd: params.cwd, ...selected,
+          ...(params.tools ? { tools: params.tools } : {}), ...(params.requiredTools ? { requiredTools: params.requiredTools } : {}),
+          ...(params.approveProject !== undefined ? { approveProject: params.approveProject } : {}),
+          ...(params.startupTimeoutMs ? { startupTimeoutMs: params.startupTimeoutMs } : {}),
+          ...(params.runTimeoutMs ? { runTimeoutMs: params.runTimeoutMs } : {}) };
+        worker.resume(params.task, overrides, params.background ? undefined : signal);
+        worker.background = params.background === true;
+        worker.save();
+        if (!params.background) await worker.done;
+        return result(worker, _id);
+      }
+      const sameProject = realpathSync(params.cwd) === realpathSync(ctx.cwd);
+      const approveProject = params.approveProject === true || (sameProject && ctx.isProjectTrusted());
+      const projectTrusted = approveProject || new ProjectTrustStore(getAgentDir()).get(params.cwd) === true;
+      const agents = discoverAgents(params.cwd, projectTrusted);
+      const agent = agents.get(params.agent ?? "general-purpose");
+      if (!agent) throw new Error(`Unknown agent ${params.agent}. Available: ${[...agents.keys()].join(", ")}`);
+      const selected = resolveModel(ctx.model && `${ctx.model.provider}/${ctx.model.id}`,
+        ctx.thinkingLevel as Thinking | undefined, agent, params.model, params.thinking);
+      const worker = new Worker({ ...params, cwd: realpathSync(params.cwd), approveProject, agent, ...selected,
+        directory: registry.newDirectory(), signal: params.background ? undefined : signal, invocation: piInvocation() });
+      registry.add(worker);
+      worker.background = params.background === true;
+      worker.save();
+      if (!params.background) await worker.done;
+      return result(worker, _id);
+    },
+  });
+  pi.registerTool({
+    name: "get_subagent_result", label: "Subagent result",
+    description: "Inspect one worker by ID, or omit id to list this parent's persisted worker IDs and statuses after compaction/reload. " +
+      "Wait up to timeoutMs for one result without waiting for siblings. " +
+      "A timed-out/canceled wait leaves the worker running. Results include bounded text, errors, usage and full transcript/session paths.",
+    parameters: Type.Object({ id: Type.Optional(Type.String()), wait: Type.Optional(Type.Boolean({ default: false })),
+      timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 60_000, default: 30_000 })) }),
+    outputSchema: Type.Union([resultSchema, Type.Object({ workers: Type.Array(resultSchema) })]),
+    async execute(_id, params, signal): Promise<AgentToolResult<WorkerResult | { workers: WorkerResult[] }>> {
+      if (!registry) throw new Error("Parent worker registry isn't available; check extension startup errors");
+      if (!params.id) {
+        const data = { workers: [...(registry?.workers.values() ?? [])].map((worker) => worker.snapshot()) };
+        return { content: [{ type: "text", text: JSON.stringify(data) }], details: data, structuredContent: data };
+      }
+      const worker = lookup(params.id);
+      if (params.wait) await wait(worker, params.timeoutMs ?? 30_000, signal);
+      return result(worker, _id);
+    },
+  });
+  pi.registerTool({
+    name: "steer_subagent", label: "Steer subagent",
+    description: "Queue a message for a running worker, delivered after its current tool calls and before its next model call. " +
+      "Doesn't interrupt a tool or restart a completed worker. A queued response isn't proof of delivery; inspect the transcript/result.",
+    parameters: Type.Object({ id: Type.String(), message: Type.String({ minLength: 1 }) }),
+    outputSchema: Type.Object({ id: Type.String(), disposition: Type.String() }),
+    async execute(_id, params) {
+      const response = await lookup(params.id).steer(params.message);
+      const data = { id: params.id, disposition: response.disposition };
+      return { content: [{ type: "text", text: JSON.stringify(data) }], details: data, structuredContent: data };
+    },
+  });
+  pi.registerTool({
+    name: "stop_subagent", label: "Stop subagent",
+    description: "Stop one worker by ID. Clears queued work, aborts the active run and closes its owned process, escalating if stalled. " +
+      "Returns stopped status and partial output; terminal workers are unchanged. Siblings aren't affected.",
+    parameters: Type.Object({ id: Type.String() }), outputSchema: resultSchema,
+    async execute(_id, params) {
+      const worker = lookup(params.id);
+      await worker.stop();
+      return result(worker, _id);
+    },
+  });
+}
