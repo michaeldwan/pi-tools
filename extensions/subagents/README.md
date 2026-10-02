@@ -72,7 +72,7 @@ The overlay loads history only for visible list rows or the open detail. Opening
 
 `view.steer(id, message)` and `view.stop(id)` dispatch directly to the existing worker methods without reporting usage. Dispose an activity when it's no longer visible and the registry view when closing the interaction. Disposal frees history/subscriptions, not workers. `Registry.detach()` disposes all registry views and their details, emitting `{kind: "disposed"}`; old views then refuse actions. Reload can open a fresh view over the same live registry. Session replacement requires the new parent's registry. Viewing never calls `takeUsage`, reconciles ledgers, or acknowledges completion.
 
-Test with pi 0.99.1; development types are pinned to that version, while host libraries remain peers and aren't bundled.
+Test with Pi 1.0.0; development types are pinned to that version, while host libraries remain peers and aren't bundled. Completion delivery still uses the follow-up behavior described above. The [host capability probes](../../README.md#development) document why quiet waiting with explicit idle-abort suppression needs upstream support before it can ship.
 
 This package doesn't manage tasks, worktrees, commits, goals or workflow recipes. A subprocess and a cwd aren't a security boundary. Review project resources before approving them.
 

@@ -104,7 +104,7 @@ async function parent(existing?: { cwd: string; session: string }) {
   const rpc = new RpcProcess({ command: process.execPath, args: [cli] }, cwd,
     ["--approve", "--model", "fixture/control", "--thinking", "high", "--extension", fileURLToPath(new URL("../..", import.meta.url)),
       "--session-dir", join(cwd, "sessions"), ...(existing ? ["--session", existing.session] : [])],
-    { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" }, (row) => rows.push(row));
+    { ...process.env, PI_RPC_SUBAGENT_CHILD: "", PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" }, (row) => rows.push(row));
   await rpc.send({ type: "get_state" });
   async function call(name: string, args: RecordValue) {
     const start = rows.length;
@@ -143,6 +143,23 @@ async function parent(existing?: { cwd: string; session: string }) {
     reload: () => rpc.send({ type: "prompt", message: "/test-reload" }),
   };
 }
+
+test("terminal retrieval still leaves a trailing automatic completion in the current implementation", async () => {
+  const p = await parent();
+  try {
+    const worker = (await p.launch("slow")).details;
+    const result = await p.call("get_subagent_result", { id: worker.id, wait: true, timeoutMs: 30_000 });
+    assert.equal(result.details.status, "completed");
+    const entries = (await p.rpc.send({ type: "get_entries" })).data.entries;
+    const retrieval = entries.findIndex((entry: RecordValue) => entry.message?.toolName === "get_subagent_result" && entry.message.details?.status === "completed");
+    const completion = entries.findIndex((entry: RecordValue) => entry.customType === "pi-rpc-subagent-completion" && entry.details.id === worker.id);
+    assert(retrieval >= 0);
+    assert(completion > retrieval, "Expected the old delivery path to repeat the retrieved report");
+    assert(entries.slice(retrieval + 1, completion).some((entry: RecordValue) => entry.message?.role === "assistant"), "Expected a parent handoff before the duplicate completion");
+    assert(entries.slice(completion + 1).some((entry: RecordValue) => entry.message?.role === "assistant"), "Expected a redundant continuation after completion");
+    console.log(`Trailing completion evidence: ${p.cwd}`);
+  } finally { await p.rpc.close(); }
+});
 
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 

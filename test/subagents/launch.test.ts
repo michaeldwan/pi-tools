@@ -13,7 +13,7 @@ function isolated() {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rpc-test-"));
   const agentDir = join(cwd, "agent");
   mkdirSync(agentDir);
-  return { cwd, agentDir, env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" } };
+  return { cwd, agentDir, env: { ...process.env, PI_RPC_SUBAGENT_CHILD: "", PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" } };
 }
 
 function fake(script: string) {

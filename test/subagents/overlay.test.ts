@@ -742,7 +742,7 @@ test("real pi RPC handles /subagents without a custom UI or model call", async (
   const records: Record<string, any>[] = [];
   const rpc = new RpcProcess({ command: process.execPath, args: [cli] }, directory,
     ["--no-session", "--extension", fileURLToPath(new URL("../..", import.meta.url))],
-    { ...process.env, PI_CODING_AGENT_DIR: directory, PI_OFFLINE: "1" }, (row) => records.push(row));
+    { ...process.env, PI_RPC_SUBAGENT_CHILD: "", PI_CODING_AGENT_DIR: directory, PI_OFFLINE: "1" }, (row) => records.push(row));
   try {
     await rpc.send({ type: "get_state" });
     const commands = (await rpc.send({ type: "get_commands" })).data.commands;
