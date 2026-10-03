@@ -29,7 +29,8 @@ const summary = (result: WorkerResult) => ({ id: result.id, attempt: result.atte
   cwd: result.cwd, model: result.model, thinking: result.thinking });
 
 export function resultText(result: WorkerResult, inspect = false) {
-  return `Worker ${result.id} attempt ${result.attempt}: ${result.status}${result.usageOnly ? " (usage only; report already handled)" : ""}${result.error ? `\n${result.error}` : ""}` +
+  if (result.usageOnly && !inspect) return `Worker ${result.id} attempt ${result.attempt}: usage only; report already handled.`;
+  return `Worker ${result.id} attempt ${result.attempt}: ${result.status}${result.error ? `\n${result.error}` : ""}` +
     `${result.text ? `\n\n${result.text}` : ""}${result.truncated ? "\n[Output truncated]" : ""}` +
     (inspect || result.error || result.truncated ?
       `\n\nWorker transcript: ${result.transcript}\nSession: ${result.sessionFile ?? "not created"}\nResult: ${result.resultPath}` : "");
@@ -79,6 +80,7 @@ export default function subagents(pi: ExtensionAPI) {
   });
   pi.on("input", event => { if (event.source !== "extension") delivery?.input(); });
   pi.on("turn_start", (_event, ctx) => delivery?.observeSignal(ctx.signal));
+  pi.on("tool_call", event => { delivery?.trackCall(event.toolCallId, event.parentToolCallId); });
   pi.on("turn_end", event => delivery?.boundary(event.outcome));
   pi.on("agent_before_settle", event => delivery?.boundary(event.outcome));
   pi.on("agent_settled", () => delivery?.wake());

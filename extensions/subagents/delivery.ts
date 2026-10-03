@@ -9,9 +9,9 @@ type Usage = WorkerResult["usage"];
 type Receipt = { id: string; attempt: number; total: Usage; delta: Usage };
 type Reservation = { callId: string; reports: Receipt[] };
 export type DeliveryState = {
-  paused: boolean; canceled: boolean; notices: Set<string>; reservations: Reservation[];
+  paused: boolean; canceled: boolean; notices: Set<string>; reservations: Reservation[]; outerCalls: Map<string, string>;
 };
-export const newDeliveryState = (): DeliveryState => ({ paused: false, canceled: false, notices: new Set(), reservations: [] });
+export const newDeliveryState = (): DeliveryState => ({ paused: false, canceled: false, notices: new Set(), reservations: [], outerCalls: new Map() });
 const key = (report: Pick<WorkerResult, "id" | "attempt">) => `${report.id}/${report.attempt}`;
 const noticeKey = (report: WorkerResult) => key(report) + (report.usageOnly ? "/usage" : "");
 const owed = (report: WorkerResult, total?: Usage) => report.usage.totalTokens > (total?.totalTokens ?? 0) || report.usage.cost.total > (total?.cost.total ?? 0);
@@ -62,6 +62,9 @@ export class Delivery {
     signal.addEventListener("abort", this.aborted, { once: true });
     if (signal.aborted) this.cancel();
   }
+  trackCall(toolCallId: string, parentToolCallId?: string) {
+    this.state.outerCalls.set(toolCallId, parentToolCallId ? this.state.outerCalls.get(parentToolCallId) ?? parentToolCallId : toolCallId);
+  }
   refresh(endOfTurn = false) {
     this.handled.clear();
     this.totals.clear();
@@ -90,7 +93,9 @@ export class Delivery {
       }
       if (entry.type === "message" && entry.message.role === "toolResult") {
         const report = entry.message.details as WorkerResult | undefined;
-        if (report?.id && report.attempt && !["starting", "running"].includes(report.status) && !ledgerCalls.has(entry.message.toolCallId)) {
+        if (["subagent", "get_subagent_result", "stop_subagent"].includes(entry.message.toolName) &&
+          report?.id && this.registry.workers.has(report.id) && report.attempt && report.usage &&
+          ["completed", "failed", "stopped", "interrupted"].includes(report.status) && !ledgerCalls.has(entry.message.toolCallId)) {
           this.handled.add(key(report));
           const total = this.totals.get(report.id) ?? emptyUsage();
           maximum(total, report.usage);
@@ -103,6 +108,7 @@ export class Delivery {
       }
     }
     this.state.reservations = this.state.reservations.filter(item => !committed.has(item.callId) && !endOfTurn);
+    if (endOfTurn) this.state.outerCalls.clear();
     for (const worker of this.registry.workers.values()) {
       const attempts = worker.reports.filter(item => this.handled.has(key(item.result))).map(item => item.result.attempt);
       worker.reconcile(Math.max(0, ...attempts), this.totals.get(worker.id));
@@ -113,7 +119,8 @@ export class Delivery {
     const reserved = new Set(this.state.reservations.flatMap(item => item.reports.map(key)));
     return [...this.registry.workers.values()].flatMap(worker => worker.reports
       .filter(item => item.background && (!this.handled.has(key(item.result)) || owed(item.result, this.totals.get(worker.id))) && !reserved.has(key(item.result)))
-      .map(item => ({ ...structuredClone(item.result), ...(this.handled.has(key(item.result)) ? { text: "", usageOnly: true } : {}) })));
+      .map(item => ({ ...structuredClone(item.result), ...(this.handled.has(key(item.result)) ?
+        { text: "", error: undefined, stopReason: undefined, truncated: false, usageOnly: true } : {}) })));
   }
   reserve(reports: WorkerResult[], callId: string) {
     this.refresh();
@@ -135,7 +142,7 @@ export class Delivery {
       if (!this.handled.has(key(report)) || delta.totalTokens || delta.cost.total) receipts.push({ id: report.id, attempt: report.attempt, total, delta });
     }
     if (receipts.length) {
-      const reservation = { callId: callId.split("/")[0], reports: receipts };
+      const reservation = { callId: this.state.outerCalls.get(callId) ?? callId, reports: receipts };
       this.state.reservations.push(reservation);
       this.pi.appendEntry(ledgerType, reservation);
     }

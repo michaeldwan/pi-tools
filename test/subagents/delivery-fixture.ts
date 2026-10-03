@@ -13,6 +13,12 @@ import {join} from 'node:path';
 export default function(pi) {
  let sequence=0;
  pi.registerCommand('fixture-reload',{description:'Reload bridge',handler:async(_args,ctx)=>{await ctx.reload();}});
+ pi.registerCommand('fixture-legacy',{description:'Create a previous-version completion with the public API',handler:async(args)=>{
+  const report=JSON.parse(args);pi.sendMessage({customType:'pi-rpc-subagent-completion',content:'Previously handled report',details:report,display:false});
+ }});
+ pi.registerTool({name:'fixture_other',label:'Other',description:'Unrelated tool with its own attempt details',parameters:Type.Object({}),async execute(){
+  return {content:[{type:'text',text:'Other tool result'}],details:{id:'not-a-worker',attempt:1,status:'done'}};
+ }});
  pi.registerTool({name:'fixture_gate',label:'Gate',description:'Deterministic fixture gate',parameters:Type.Object({gate:Type.String()}),
   async execute(_id,{gate},signal,_update,ctx) {
    const path=join(ctx.cwd,gate);
@@ -68,12 +74,15 @@ export default function(pi) {
     else if(last?.role==='user' && prompt.includes('Subagent results are ready.')) calls=[{name:'wait_for_subagents',args:{}}];
     const summarizing=context.messages.some(m=>m.role==='system' && (text(m)??'').includes('You are a context summarization assistant.'));
     if(calls && !summarizing) {
-     output.stopReason='toolUse';output.content=calls.map(c=>({type:'toolCall',id:'delivery-'+(++sequence),name:c.name,arguments:c.args}));
+     output.stopReason='toolUse';output.content=calls.map(c=>({type:'toolCall',id:c.id??'delivery-'+(++sequence),name:c.name,arguments:c.args}));
      output.content.forEach((toolCall,contentIndex)=>{stream.push({type:'toolcall_start',contentIndex,partial:output});stream.push({type:'toolcall_end',contentIndex,toolCall,partial:output});});
     } else {
      const users=context.messages.filter(m=>m.role==='user').map(text);
      const task=users.filter(p=>p?.startsWith('{"worker"')).at(-1);
      const value=spec?.worker?'Report '+spec.worker:task?'Report '+JSON.parse(task).worker:'Final handoff';
+     if(task && JSON.parse(task).worker==='legacy-failed') {
+      output.stopReason='error';output.errorMessage='already-refuted failure';stream.push({type:'error',reason:'error',error:output});stream.end();return;
+     }
      output.content=[{type:'text',text:value}];
      stream.push({type:'text_start',contentIndex:0,partial:output});stream.push({type:'text_delta',contentIndex:0,delta:value,partial:output});stream.push({type:'text_end',contentIndex:0,content:value,partial:output});
     }

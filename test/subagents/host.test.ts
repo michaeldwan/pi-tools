@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RpcProcess, type RecordValue } from "../../extensions/subagents/rpc.ts";
 
-// This is a host capability probe, not the proposed subagent implementation.
+// This probes host capabilities independently of the subagent implementation.
 // It uses only public extension APIs and an isolated deterministic provider.
 const fixture = `
 import { createAssistantMessageEventStream } from '@earendil-works/pi-ai';
@@ -107,7 +107,7 @@ test("Pi 1.0.0 quiet yield leaves idle abort unobservable to public extension ho
     const start = p.rows.length;
     await p.rpc.send({ type: "abort" });
     const after = await p.state();
-    assert.deepEqual(after, before, "An idle abort must be detectable before this plan can pause automatic wakes");
+    assert.deepEqual(after, before, "Pi 1.0.0 has no public idle-abort notification; explicit pause controls automatic wakes");
     assert(!p.rows.slice(start).some(row => ["agent_start", "agent_end", "agent_before_settle", "agent_settled"].includes(row.type)));
     // A supported wake still runs after the abort. The extension received no
     // information with which to suppress it while retaining normal idle wakes.

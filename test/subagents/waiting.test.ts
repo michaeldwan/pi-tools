@@ -196,7 +196,13 @@ test("nine reports across five reviewers and four resumed verifications don't re
     assert.equal(batches[1].message.details.reports.length, 4);
     assert(batches[1].message.details.reports.every((report: any) => report.text.includes("verified-fixed") && !report.text.includes("review-refuted")));
     await p.command("/fixture-reload");
-    assert.equal(receipts(await p.entries()).length, 9);
+    const persisted = await p.entries();
+    assert.equal(receipts(persisted).length, 9);
+    const final = entries.findIndex((entry, index) => index > entries.indexOf(batches[1]) &&
+      entry.message?.role === "assistant" && entry.message.content.some((part: any) => part.text === "Final handoff"));
+    assert(final >= 0);
+    assert(!persisted.slice(final + 1).some(entry => entry.customType === "pi-rpc-subagent-ready" || entry.message?.role === "assistant"));
+    assert.equal(persisted.filter(entry => entry.message?.toolName === "wait_for_subagents").length, 2);
     await verifyUsage(p, 90);
     console.log(`Nine-report resumed-verification RPC evidence: ${p.cwd}`);
   } finally { await p.rpc.close(); }

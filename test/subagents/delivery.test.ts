@@ -79,6 +79,56 @@ test("direct and codemode terminal retrieval acknowledge the same report and don
   }
 });
 
+test("unrelated tool attempt details don't become worker receipts or break collection", async () => {
+  const p = await parent();
+  try {
+    await p.call("fixture_other");
+    const result = await p.call("wait_for_subagents");
+    assert.equal(result.isError, undefined);
+    assert.equal(result.details.waiting, false);
+    assert(!p.rows.some(row => row.type === "extension_error"));
+  } finally { await p.rpc.close(); }
+});
+
+test("model-issued IDs containing slashes commit nested receipts against the actual outer result", async () => {
+  const p = await parent();
+  try {
+    const worker = await p.launch("slash-id", "worker");
+    await p.gateStarted("worker");
+    await p.command("/subagents pause");
+    p.release("worker");
+    await eventually(() => p.snapshot(worker).status === "completed");
+    await p.rpc.run(JSON.stringify({ calls: [{ id: "outer/call", name: "codemode",
+      args: { code: `return await tools.get_subagent_result({id:${JSON.stringify(worker.id)}});` } }] }));
+    assert.equal(receipts(await p.entries()).filter(key => key === worker.id + "/1").length, 1);
+    await p.command("/fixture-reload");
+    await p.command("/subagents resume");
+    assert(!(await p.entries()).some(entry => entry.customType === "pi-rpc-subagent-ready"));
+    await usageIsExact(p, 10);
+  } finally { await p.rpc.close(); }
+});
+
+test("previously handled failed reports collect owed usage without replaying old errors", async () => {
+  const p = await parent();
+  try {
+    const worker = await p.launch("legacy-failed", "worker");
+    await p.gateStarted("worker");
+    await p.command("/subagents pause");
+    p.release("worker");
+    await eventually(() => p.snapshot(worker).status === "failed");
+    await p.command("/fixture-legacy " + JSON.stringify(p.snapshot(worker)));
+    await p.command("/subagents resume");
+    await p.collected(worker.id);
+    const collection = (await p.entries()).find(entry => entry.message?.toolName === "wait_for_subagents");
+    assert(collection);
+    assert.equal(collection.message.details.reports[0].usageOnly, true);
+    assert(!JSON.stringify(collection.message.content).includes("already-refuted failure"));
+    assert(!JSON.stringify(collection.message.details.reports[0]).includes("already-refuted failure"));
+    assert(p.snapshot(worker).error.includes("already-refuted failure"), "Saved diagnosis must remain intact");
+    await usageIsExact(p, 10);
+  } finally { await p.rpc.close(); }
+});
+
 test("a crash after collection reserves usage but before the parent commits recovers the report and accounts it once", async () => {
   const p = await parent();
   let reopened: Awaited<ReturnType<typeof parent>> | undefined;
