@@ -202,6 +202,35 @@ test("nine reports across five reviewers and four resumed verifications don't re
   } finally { await p.rpc.close(); }
 });
 
+test("background launch data stays compact through direct calls and codemode, with evidence on explicit inspection", async () => {
+  for (const nested of [false, true]) {
+    const p = await parent();
+    try {
+      const args = { task: JSON.stringify({ worker: 'compact-launch', gate: 'worker' }), cwd: p.cwd, background: true, approveProject: true };
+      const response = await p.call(nested ? 'codemode' : 'subagent', nested ? { code: `text(await tools.subagent(${JSON.stringify(args)}));` } : args);
+      const text = JSON.stringify(response.content);
+      assert(!text.includes('rpc.jsonl'));
+      assert(!text.includes('resultPath'));
+      assert.match(text, /automatic/);
+      if (!nested) {
+        assert.equal(response.structuredContent.completion, 'automatic');
+        assert.equal(response.structuredContent.transcript, undefined);
+      }
+      await p.gateStarted('worker');
+      const list = await p.call('get_subagent_result');
+      assert.equal(list.details.workers.length, 1);
+      assert.equal(list.details.workers[0].transcript, undefined);
+      const id = list.details.workers[0].id;
+      const inspection = await p.call('get_subagent_result', { id });
+      assert(inspection.details.transcript);
+      assert.match(inspection.content[0].text, /Worker transcript/);
+      p.release('worker');
+      await p.collected(id);
+      await verifyUsage(p, 10);
+    } finally { await p.rpc.close(); }
+  }
+});
+
 test("actual compaction, live reload and parent restart preserve receipts and don't replay collected reports", async () => {
   const p = await parent();
   let reopened: Awaited<ReturnType<typeof parent>> | undefined;

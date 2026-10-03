@@ -2,6 +2,7 @@ import { getAgentDir, ProjectTrustStore, type ExtensionAPI, type AgentToolResult
 import { isAbsolute } from "node:path";
 import { realpathSync } from "node:fs";
 import { Type } from "typebox";
+import { Text } from "@earendil-works/pi-tui";
 import { discoverAgents, resolveModel, thinkingLevels, type Thinking } from "./agents.ts";
 import { childConfigKey } from "./guard.ts";
 import { piInvocation } from "./rpc.ts";
@@ -21,10 +22,17 @@ const resultSchema = Type.Object({
   stats: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 });
 
-export function resultText(result: WorkerResult) {
-  return `Worker ${result.id}: ${result.status}${result.error ? `\n${result.error}` : ""}` +
+const summarySchema = Type.Object({ id: Type.String(), attempt: Type.Number(), status: Type.String(),
+  cwd: Type.String(), model: Type.String(), thinking: Type.String() });
+const launchSchema = Type.Intersect([summarySchema, Type.Object({ completion: Type.Literal("automatic"), guidance: Type.String() })]);
+const summary = (result: WorkerResult) => ({ id: result.id, attempt: result.attempt, status: result.status,
+  cwd: result.cwd, model: result.model, thinking: result.thinking });
+
+export function resultText(result: WorkerResult, inspect = false) {
+  return `Worker ${result.id} attempt ${result.attempt}: ${result.status}${result.usageOnly ? " (usage only; report already handled)" : ""}${result.error ? `\n${result.error}` : ""}` +
     `${result.text ? `\n\n${result.text}` : ""}${result.truncated ? "\n[Output truncated]" : ""}` +
-    `\n\nWorker transcript: ${result.transcript}\nSession: ${result.sessionFile ?? "not created"}\nResult: ${result.resultPath}`;
+    (inspect || result.error || result.truncated ?
+      `\n\nWorker transcript: ${result.transcript}\nSession: ${result.sessionFile ?? "not created"}\nResult: ${result.resultPath}` : "");
 }
 
 async function wait(worker: Worker, timeoutMs: number, signal?: AbortSignal) {
@@ -48,9 +56,11 @@ export default function subagents(pi: ExtensionAPI) {
   let registry: Registry | undefined;
   let delivery: Delivery | undefined;
   let quitting = false;
+  let updateStatus = () => {};
   registerSubagentsUI(pi, () => registry, action => {
     if (!delivery) throw new Error("Parent worker registry isn't available");
     if (action === "pause") delivery.pause(); else delivery.resume();
+    updateStatus();
   });
   pi.on("session_start", (event, ctx) => {
     quitting = false;
@@ -58,12 +68,14 @@ export default function subagents(pi: ExtensionAPI) {
     registry = opened.registry;
     delivery = new Delivery(pi, registry, ctx, event.reason === "reload" && opened.live);
     delivery.observeSignal(ctx.signal);
-    registry.changed = () => {
+    updateStatus = () => {
       const active = [...registry!.workers.values()].filter(item => !item.terminal).length;
-      ctx.ui.setStatus("pi-rpc-subagents", active ? `${active} worker${active === 1 ? "" : "s"} active` : undefined);
-      delivery?.wake();
+      const status = [active ? `${active} worker${active === 1 ? "" : "s"} active` : "", delivery?.paused ? "results paused" : ""].filter(Boolean).join(" · ");
+      ctx.ui.setStatus("pi-rpc-subagents", status || undefined);
     };
-    registry.changed([...registry.workers.values()][0]);
+    registry.changed = () => { updateStatus(); delivery?.wake(); };
+    updateStatus();
+    delivery.wake();
   });
   pi.on("input", event => { if (event.source !== "extension") delivery?.input(); });
   pi.on("turn_start", (_event, ctx) => delivery?.observeSignal(ctx.signal));
@@ -75,10 +87,17 @@ export default function subagents(pi: ExtensionAPI) {
     if (!worker) throw new Error(`Unknown worker ${id}. Use the ID returned by subagent in this parent session.`);
     return worker;
   };
-  const result = (worker: Worker, callId: string) => {
+  const launched = (worker: Worker) => {
+    const snapshot = worker.snapshot();
+    const data = { ...summary(snapshot), completion: "automatic" as const,
+      guidance: "Continue independent work, then call wait_for_subagents to yield quietly. Don't poll or emit acknowledgment-only replies." };
+    return { content: [{ type: "text" as const, text: `Worker ${snapshot.id} attempt ${snapshot.attempt}: ${snapshot.status}. Completion is automatic. ${data.guidance}` }],
+      details: snapshot, structuredContent: data };
+  };
+  const result = (worker: Worker, callId: string, inspect = true) => {
     const snapshot = worker.snapshot();
     const usage = worker.terminal ? delivery!.reserve([snapshot], callId) : undefined;
-    return { content: [{ type: "text" as const, text: resultText(snapshot) }], details: snapshot,
+    return { content: [{ type: "text" as const, text: resultText(snapshot, inspect) }], details: snapshot,
       structuredContent: snapshot, isError: ["failed", "stopped", "interrupted"].includes(snapshot.status), usage };
   };
   pi.on("session_shutdown", async (event) => {
@@ -92,7 +111,8 @@ export default function subagents(pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent", label: "Subagent",
     description: "Start one fresh pi RPC worker in an explicit absolute cwd. background:true returns a stable ID before startup completes; " +
-      "otherwise waits for settlement. Workers run independently. Inherits provider/model and thinking unless overridden. " +
+      "otherwise waits for settlement. Background completion is automatic: continue independent work, then use wait_for_subagents to yield quietly. " +
+      "Don't poll or read full transcripts to wait; don't emit acknowledgment-only replies. Workers run independently. Inherits provider/model and thinking unless overridden. " +
       "Loads normal child resources, blocks recursive delegation and checks required tools before work. " +
       "Default agent: general-purpose; read-only defaults: Explore and Plan. resume:<worker ID> explicitly continues the same " +
       "persisted conversation after settlement, stop or interruption. Resume retains cwd, agent, model, thinking and restrictions unless " +
@@ -112,7 +132,7 @@ export default function subagents(pi: ExtensionAPI) {
       runTimeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 86_400_000, default: 600_000,
         description: "Hard settlement deadline; stalled work fails and its process is closed" })),
     }),
-    outputSchema: resultSchema,
+    outputSchema: Type.Union([launchSchema, resultSchema]),
     async execute(_id, params, signal, _onUpdate, ctx) {
       if (quitting || !registry) throw new Error("Parent worker registry isn't available; can't launch workers");
       signal?.throwIfAborted();
@@ -133,7 +153,7 @@ export default function subagents(pi: ExtensionAPI) {
         worker.background = params.background === true;
         worker.save();
         if (!params.background) await worker.done;
-        return result(worker, _id);
+        return params.background ? launched(worker) : result(worker, _id, false);
       }
       const sameProject = realpathSync(params.cwd) === realpathSync(ctx.cwd);
       const approveProject = params.approveProject === true || (sameProject && ctx.isProjectTrusted());
@@ -149,7 +169,7 @@ export default function subagents(pi: ExtensionAPI) {
       worker.background = params.background === true;
       worker.save();
       if (!params.background) await worker.done;
-      return result(worker, _id);
+      return params.background ? launched(worker) : result(worker, _id, false);
     },
   });
   pi.registerTool({
@@ -165,24 +185,29 @@ export default function subagents(pi: ExtensionAPI) {
       const usage = delivery.reserve(reports, callId);
       const waiting = !reports.length && [...registry.workers.values()].some(worker => !worker.terminal);
       const data = { reports, waiting, paused: delivery.paused };
-      return { content: [{ type: "text" as const, text: reports.length ? reports.map(resultText).join("\n\n") :
+      return { content: [{ type: "text" as const, text: reports.length ? reports.map(report => resultText(report)).join("\n\n") :
         delivery.paused ? "Automatic results are paused. Use /subagents resume; explicit get_subagent_result remains available." :
         waiting ? "Quietly waiting for workers. Parent input remains available; results resume processing automatically." : "No live workers or unhandled reports." }],
         details: data, structuredContent: data, usage, terminate: !reports.length && (waiting || delivery.paused) };
+    },
+    renderResult(result, _options, theme) {
+      const data = result.details;
+      return new Text(theme.fg("muted", data ? data.reports.length ? `${data.reports.length} worker report${data.reports.length === 1 ? "" : "s"} collected` :
+        data.paused ? "Automatic results paused" : data.waiting ? "Waiting quietly for workers" : "No pending workers" : "Result collection failed; inspect /subagents."), 0, 0);
     },
   });
   pi.registerTool({
     name: "get_subagent_result", label: "Subagent result",
     description: "Inspect one worker by ID, or omit id to list this parent's persisted worker IDs and statuses after compaction/reload. " +
-      "Wait up to timeoutMs for one result without waiting for siblings. " +
-      "A timed-out/canceled wait leaves the worker running. Results include bounded text, errors, usage and full transcript/session paths.",
+      "This is explicit inspection, not the background completion path. Use wait_for_subagents to await automatic results; don't poll. " +
+      "Legacy diagnostic wait:true waits up to timeoutMs for one worker; timeout/cancellation leaves it running. Explicit results include bounded text and full evidence paths.",
     parameters: Type.Object({ id: Type.Optional(Type.String()), wait: Type.Optional(Type.Boolean({ default: false })),
       timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: 60_000, default: 30_000 })) }),
-    outputSchema: Type.Union([resultSchema, Type.Object({ workers: Type.Array(resultSchema) })]),
-    async execute(_id, params, signal): Promise<AgentToolResult<WorkerResult | { workers: WorkerResult[] }>> {
+    outputSchema: Type.Union([resultSchema, Type.Object({ workers: Type.Array(summarySchema) })]),
+    async execute(_id, params, signal): Promise<AgentToolResult<WorkerResult | { workers: ReturnType<typeof summary>[] }>> {
       if (!registry) throw new Error("Parent worker registry isn't available; check extension startup errors");
       if (!params.id) {
-        const data = { workers: [...(registry?.workers.values() ?? [])].map((worker) => worker.snapshot()) };
+        const data = { workers: [...(registry?.workers.values() ?? [])].map(worker => summary(worker.snapshot())) };
         return { content: [{ type: "text", text: JSON.stringify(data) }], details: data, structuredContent: data };
       }
       const worker = lookup(params.id);
