@@ -144,7 +144,7 @@ async function parent(existing?: { cwd: string; session: string }) {
   };
 }
 
-test("terminal retrieval still leaves a trailing automatic completion in the current implementation", async () => {
+test("terminal retrieval suppresses trailing automatic completion and redundant replies", async () => {
   const p = await parent();
   try {
     const worker = (await p.launch("slow")).details;
@@ -154,9 +154,9 @@ test("terminal retrieval still leaves a trailing automatic completion in the cur
     const retrieval = entries.findIndex((entry: RecordValue) => entry.message?.toolName === "get_subagent_result" && entry.message.details?.status === "completed");
     const completion = entries.findIndex((entry: RecordValue) => entry.customType === "pi-rpc-subagent-completion" && entry.details.id === worker.id);
     assert(retrieval >= 0);
-    assert(completion > retrieval, "Expected the old delivery path to repeat the retrieved report");
-    assert(entries.slice(retrieval + 1, completion).some((entry: RecordValue) => entry.message?.role === "assistant"), "Expected a parent handoff before the duplicate completion");
-    assert(entries.slice(completion + 1).some((entry: RecordValue) => entry.message?.role === "assistant"), "Expected a redundant continuation after completion");
+    assert.equal(completion, -1);
+    assert.equal(entries.slice(retrieval + 1).filter((entry: RecordValue) => entry.message?.role === "assistant").length, 1);
+    assert(!entries.slice(retrieval + 1).some((entry: RecordValue) => entry.customType === "pi-rpc-subagent-ready"));
     console.log(`Trailing completion evidence: ${p.cwd}`);
   } finally { await p.rpc.close(); }
 });
@@ -204,7 +204,7 @@ test("registered background tools start promptly, finish independently, steer an
     const again = await p.call("stop_subagent", { id: slow.id });
     assert.equal(again.details.status, "stopped");
     const notifications = p.rows.filter((row) => row.type === "message_end" && row.message?.customType === "pi-rpc-subagent-completion");
-    for (const id of [fast.id, slow.id]) assert.equal(notifications.filter((row) => row.message.details.id === id).length, 1);
+    assert.equal(notifications.length, 0);
   } finally { await p.rpc.close(); }
 });
 
@@ -358,7 +358,7 @@ test("actual compaction and ctx.reload retain active ownership and deduplicate c
     assert.equal(list.details.workers[0].id, started.id);
     assert.equal((await p.call("get_subagent_result", { id: started.id })).usage, undefined);
     const notifications = p.rows.filter((row) => row.type === "message_end" && row.message?.customType === "pi-rpc-subagent-completion");
-    assert.equal(notifications.filter((row) => row.message.details.id === started.id).length, 1);
+    assert.equal(notifications.length, 0);
     assert(!alive(active.pid));
   } finally { await p.rpc.close(); }
 });
@@ -588,7 +588,7 @@ test("reload during streaming doesn't duplicate a completion already queued in t
     await p.rpc.send({ type: "abort" });
     await p.call("get_subagent_result", { id: started.id });
     const entries = (await p.rpc.send({ type: "get_entries" })).data.entries;
-    assert.equal(entries.filter((entry: RecordValue) => entry.customType === "pi-rpc-subagent-completion" && entry.details.id === started.id).length, 1);
+    assert.equal(entries.filter((entry: RecordValue) => entry.customType === "pi-rpc-subagent-completion").length, 0);
   } finally { await p.rpc.close(); }
 });
 
@@ -615,7 +615,7 @@ test("restart delivers completion queued during streaming but never persisted", 
     await reopened.reload();
     await reopened.call("get_subagent_result", { id: started.id });
     const persisted = (await reopened.rpc.send({ type: "get_entries" })).data.entries;
-    assert.equal(persisted.filter((entry: RecordValue) => entry.customType === "pi-rpc-subagent-completion" && entry.details.id === started.id).length, 1);
+    assert.equal(persisted.filter((entry: RecordValue) => entry.customType === "pi-rpc-subagent-completion").length, 0);
   } finally { await p.rpc.close(); await reopened?.rpc.close(); }
 });
 
@@ -633,7 +633,7 @@ test("restart reports usage reserved before a tool result but not committed to t
     await p.rpc.send({ type: "prompt", message: JSON.stringify({ name: "get_subagent_result", args: { id: started.id } }), streamingBehavior: "followUp" });
     await toolStarted(join(p.cwd, "usage-return-paused"));
     const entries = (await p.rpc.send({ type: "get_entries" })).data.entries;
-    assert(entries.some((entry: RecordValue) => entry.customType === "pi-rpc-subagent-usage"));
+    assert(entries.some((entry: RecordValue) => entry.customType === "pi-rpc-subagent-delivery"));
     assert(!entries.some((entry: RecordValue) => entry.message?.role === "toolResult" && entry.message.toolName === "get_subagent_result"));
     p.rpc.child.kill("SIGKILL");
     await p.rpc.close();

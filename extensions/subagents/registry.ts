@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, unlin
 import { join, dirname, basename, resolve } from "node:path";
 import { Worker } from "./worker.ts";
 import type { Invocation } from "./rpc.ts";
+import { newDeliveryState } from "./delivery.ts";
 import { notify, type WorkerActivity, type ActivityChange } from "./activity.ts";
 
 function sessionPath(path: string) {
@@ -24,6 +25,7 @@ const registries = globals[key] ??= new Map<string, Registry>();
 
 export class Registry {
   readonly workers = new Map<string, Worker>();
+  deliveryState = newDeliveryState();
   changed: (worker: Worker) => void = () => {};
   private lock: string;
   private closing?: Promise<void>;

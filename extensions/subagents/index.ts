@@ -7,6 +7,7 @@ import { childConfigKey } from "./guard.ts";
 import { piInvocation } from "./rpc.ts";
 import { Worker, type WorkerResult } from "./worker.ts";
 import { Registry } from "./registry.ts";
+import { Delivery } from "./delivery.ts";
 import { registerSubagentsUI } from "./overlay.ts";
 
 const resultSchema = Type.Object({
@@ -16,6 +17,7 @@ const resultSchema = Type.Object({
   text: Type.String(), truncated: Type.Boolean(), error: Type.Optional(Type.String()), stopReason: Type.Optional(Type.String()),
   usage: Type.Object({ input: Type.Number(), output: Type.Number(), cacheRead: Type.Number(), cacheWrite: Type.Number(), totalTokens: Type.Number(),
     cost: Type.Object({ input: Type.Number(), output: Type.Number(), cacheRead: Type.Number(), cacheWrite: Type.Number(), total: Type.Number() }) }),
+  usageOnly: Type.Optional(Type.Boolean()),
   stats: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 });
 
@@ -43,56 +45,25 @@ async function wait(worker: Worker, timeoutMs: number, signal?: AbortSignal) {
 
 export default function subagents(pi: ExtensionAPI) {
   if (process.env[childConfigKey]) return;
-  const usageEntry = "pi-rpc-subagent-usage";
   let registry: Registry | undefined;
+  let delivery: Delivery | undefined;
   let quitting = false;
   registerSubagentsUI(pi, () => registry);
   pi.on("session_start", (event, ctx) => {
     quitting = false;
     const opened = Registry.open(getAgentDir(), ctx.sessionManager.getSessionId(), piInvocation(), ctx.sessionManager.getSessionFile());
     registry = opened.registry;
-    // Disk markers can precede delivery. The parent's raw persisted entries
-    // decide what was received, including history removed from model context.
-    const entries = ctx.sessionManager.getEntries();
-    const committed = new Set(entries.filter((entry) => entry.type === "message" &&
-      entry.message.role === "toolResult" && entry.message.usage).map((entry) =>
-      (entry as { message: { toolCallId: string } }).message.toolCallId));
-    for (const worker of registry.workers.values()) {
-      let notifiedAttempt = 0;
-      let reportedUsage: WorkerResult["usage"] | undefined;
-      for (const entry of entries) {
-        if (entry.type === "custom_message" && entry.customType === "pi-rpc-subagent-completion") {
-          const detail = entry.details as WorkerResult | undefined;
-          if (detail?.id === worker.id) notifiedAttempt = Math.max(notifiedAttempt, detail.attempt);
-        }
-        if (entry.type === "custom" && entry.customType === usageEntry) {
-          const ledger = entry.data as { id: string; callId: string; total: WorkerResult["usage"] };
-          if (ledger.id === worker.id && committed.has(ledger.callId)) reportedUsage = ledger.total;
-        }
-        // Also recognize directly persisted tool results from earlier loads.
-        if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
-          const detail = entry.message.details as WorkerResult | undefined;
-          if (detail?.id === worker.id) reportedUsage = detail.usage;
-        }
-      }
-      // Reload keeps the live parent's follow-up queue and pending tool results.
-      // Only disk recovery must roll back markers not committed to its transcript.
-      const keepLive = event.reason === "reload" && opened.live;
-      worker.reconcile(keepLive ? Math.max(notifiedAttempt, worker.notifiedAttempt) : notifiedAttempt,
-        keepLive ? worker.reportedUsage : reportedUsage);
-    }
-    registry.changed = (worker) => {
-      const active = [...registry!.workers.values()].filter((item) => !item.terminal).length;
+    delivery = new Delivery(pi, registry, ctx, event.reason === "reload" && opened.live);
+    registry.changed = () => {
+      const active = [...registry!.workers.values()].filter(item => !item.terminal).length;
       ctx.ui.setStatus("pi-rpc-subagents", active ? `${active} worker${active === 1 ? "" : "s"} active` : undefined);
-      if (!worker.terminal || !worker.background || worker.notifiedAttempt >= worker.snapshot().attempt) return;
-      worker.notifiedAttempt = worker.snapshot().attempt;
-      worker.save();
-      const snapshot = worker.snapshot();
-      pi.sendMessage({ customType: "pi-rpc-subagent-completion", content: resultText(snapshot), display: true,
-        details: snapshot }, { deliverAs: "followUp", triggerTurn: true });
+      delivery?.wake();
     };
-    for (const worker of registry.workers.values()) registry.changed(worker);
+    registry.changed([...registry.workers.values()][0]);
   });
+  pi.on("turn_end", event => delivery?.boundary(event.outcome));
+  pi.on("agent_before_settle", event => delivery?.boundary(event.outcome));
+  pi.on("agent_settled", () => delivery?.wake());
   const lookup = (id: string) => {
     const worker = registry?.workers.get(id);
     if (!worker) throw new Error(`Unknown worker ${id}. Use the ID returned by subagent in this parent session.`);
@@ -100,12 +71,12 @@ export default function subagents(pi: ExtensionAPI) {
   };
   const result = (worker: Worker, callId: string) => {
     const snapshot = worker.snapshot();
-    const usage = worker.takeUsage();
-    if (usage) pi.appendEntry(usageEntry, { id: worker.id, callId: callId.split("/")[0], total: worker.reportedUsage });
+    const usage = worker.terminal ? delivery!.reserve([snapshot], callId) : undefined;
     return { content: [{ type: "text" as const, text: resultText(snapshot) }], details: snapshot,
       structuredContent: snapshot, isError: ["failed", "stopped", "interrupted"].includes(snapshot.status), usage };
   };
   pi.on("session_shutdown", async (event) => {
+    delivery?.detach();
     registry?.detach();
     if (event.reason === "reload") return;
     quitting = true;
@@ -173,6 +144,20 @@ export default function subagents(pi: ExtensionAPI) {
       worker.save();
       if (!params.background) await worker.done;
       return result(worker, _id);
+    },
+  });
+  pi.registerTool({
+    name: "wait_for_subagents", label: "Wait for subagents", exposure: "model-only",
+    description: "Collect available unhandled worker reports once after a result-ready notification. Don't poll.",
+    parameters: Type.Object({}),
+    outputSchema: Type.Object({ reports: Type.Array(resultSchema) }),
+    async execute(callId) {
+      if (!delivery) throw new Error("Parent worker registry isn't available");
+      const reports = delivery.pending();
+      const usage = delivery.reserve(reports, callId);
+      const data = { reports };
+      return { content: [{ type: "text" as const, text: reports.length ? reports.map(resultText).join("\n\n") : "No unhandled reports." }],
+        details: data, structuredContent: data, usage };
     },
   });
   pi.registerTool({

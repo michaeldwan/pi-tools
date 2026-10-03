@@ -82,6 +82,7 @@ export type WorkerResult = {
   error?: string;
   stopReason?: string;
   usage: ReturnType<typeof emptyUsage>;
+  usageOnly?: boolean;
   stats?: RecordValue;
 }
 
@@ -93,6 +94,7 @@ export class Worker {
   readonly directory: string;
   done: Promise<void>;
   background = false;
+  reports: { result: WorkerResult; background: boolean }[] = [];
   notifiedAttempt = 0;
   reportedUsage = emptyUsage();
   private result: WorkerResult;
@@ -158,6 +160,7 @@ export class Worker {
     delete result.pid;
     const worker = new Worker({ ...state.options, directory, invocation }, undefined, result);
     worker.background = state.background;
+    worker.reports = state.reports ?? [];
     worker.notifiedAttempt = state.notifiedAttempt;
     worker.reportedUsage = state.reportedUsage;
     worker.confirmedSelection = state.confirmedSelection;
@@ -202,9 +205,12 @@ export class Worker {
 
   save() {
     const { signal: _signal, env: _env, invocation: _invocation, directory: _directory, ...options } = this.options;
+    if (this.terminal && !this.reports.some(item => item.result.attempt === this.result.attempt)) {
+      this.reports.push({ result: this.snapshot(), background: this.background });
+    }
     for (const [path, value] of [[join(this.directory, "state.json"),
       { version: 1, options, result: this.result, background: this.background, notifiedAttempt: this.notifiedAttempt,
-        reportedUsage: this.reportedUsage, confirmedSelection: this.confirmedSelection }], [this.result.resultPath, this.result]] as const) {
+        reportedUsage: this.reportedUsage, confirmedSelection: this.confirmedSelection, reports: this.reports }], [this.result.resultPath, this.result]] as const) {
       writeFileSync(path + ".tmp", JSON.stringify(value, null, 2), { mode: 0o600 });
       renameSync(path + ".tmp", path);
     }
