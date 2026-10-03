@@ -31,6 +31,8 @@ export class Delivery {
   private handled = new Set<string>();
   private totals = new Map<string, Usage>();
   private detached = false;
+  private signal?: AbortSignal;
+  private aborted = () => this.cancel();
   private pi: ExtensionAPI;
   private registry: Registry;
   private ctx: ExtensionContext;
@@ -52,7 +54,14 @@ export class Delivery {
   }
   get paused() { return this.registry.deliveryState.paused; }
   private get state() { return this.registry.deliveryState; }
-  detach() { this.detached = true; }
+  detach() { this.detached = true; this.signal?.removeEventListener("abort", this.aborted); }
+  observeSignal(signal?: AbortSignal) {
+    if (!signal || signal === this.signal) return;
+    this.signal?.removeEventListener("abort", this.aborted);
+    this.signal = signal;
+    signal.addEventListener("abort", this.aborted, { once: true });
+    if (signal.aborted) this.cancel();
+  }
   refresh(endOfTurn = false) {
     this.handled.clear();
     this.totals.clear();

@@ -4,7 +4,7 @@ import { createServer, type Server } from "node:net";
 import { assertSessionAvailable } from "./rpc.ts";
 
 export const childConfigKey = "PI_RPC_SUBAGENT_CHILD";
-export const delegationTools = ["subagent", "get_subagent_result", "steer_subagent", "stop_subagent"];
+export const delegationTools = ["subagent", "get_subagent_result", "steer_subagent", "stop_subagent", "wait_for_subagents"];
 export interface ChildConfig { tools?: string[]; readOnly?: boolean; parentPid?: number; leasePath?: string }
 
 export default function guard(pi: ExtensionAPI) {

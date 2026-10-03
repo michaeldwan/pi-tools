@@ -432,7 +432,8 @@ export class SubagentsOverlay implements Component {
 }
 
 /** One interaction per runtime; registry disposal closes it on reload/replacement. */
-export function registerSubagentsUI(pi: ExtensionAPI, registry: () => Registry | undefined) {
+export function registerSubagentsUI(pi: ExtensionAPI, registry: () => Registry | undefined,
+  control?: (action: "pause" | "resume") => void) {
   let current: SubagentsOverlay | undefined;
   let opening = false;
   const open = async (ctx: ExtensionContext) => {
@@ -448,7 +449,17 @@ export function registerSubagentsUI(pi: ExtensionAPI, registry: () => Registry |
       }, { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "90%" } });
     } finally { current?.dispose(); current = undefined; opening = false; }
   };
-  pi.registerCommand("subagents", { description: "Inspect, steer or stop this parent's workers", handler: async (_args, ctx) => open(ctx) });
+  pi.registerCommand("subagents", { description: "Inspect workers, or pause/resume automatic results", handler: async (args, ctx) => {
+    const action = args.trim();
+    if (action === "pause" || action === "resume") {
+      if (!control || !registry()) { ctx.ui.notify("Worker registry isn't available.", "error"); return; }
+      control(action);
+      ctx.ui.notify(action === "pause" ? "Automatic subagent results paused. Workers continue; explicit retrieval remains available." : "Automatic subagent results resumed.");
+      return;
+    }
+    if (action) { ctx.ui.notify("Use /subagents, /subagents pause or /subagents resume.", "warning"); return; }
+    await open(ctx);
+  } });
   pi.registerShortcut("ctrl+alt+s", { description: "Open subagent workers", handler: open });
   pi.on("session_shutdown", () => { current?.close(); });
 }

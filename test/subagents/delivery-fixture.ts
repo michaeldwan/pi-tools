@@ -8,7 +8,7 @@ import { RpcProcess, type RecordValue } from "../../extensions/subagents/rpc.ts"
 const provider = `
 import {createAssistantMessageEventStream} from '@earendil-works/pi-ai';
 import {Type} from 'typebox';
-import {existsSync,watch,writeFileSync,appendFileSync} from 'node:fs';
+import {existsSync,watch,writeFileSync,appendFileSync,unlinkSync} from 'node:fs';
 import {join} from 'node:path';
 export default function(pi) {
  let sequence=0;
@@ -30,6 +30,16 @@ export default function(pi) {
  pi.on('tool_result',async(e,ctx)=>{
   if(['wait_for_subagents','get_subagent_result'].includes(e.toolName) && e.usage && existsSync(join(ctx.cwd,'crash-on-collect'))) {
    writeFileSync(join(ctx.cwd,'collection-reserved'),'reserved');await new Promise(()=>{});
+  }
+ });
+ pi.on('agent_before_settle',async(_event,ctx)=>{
+  const flag=join(ctx.cwd,'near-settle-request');
+  if(!process.env.PI_RPC_SUBAGENT_CHILD && existsSync(flag)) {
+   unlinkSync(flag);writeFileSync(join(ctx.cwd,'near-settle.started'),'started');
+   await new Promise(resolve=>{
+    const observer=watch(ctx.cwd,()=>{if(existsSync(join(ctx.cwd,'near-settle'))){observer.close();resolve();}});
+    if(existsSync(join(ctx.cwd,'near-settle'))){observer.close();resolve();}
+   });
   }
  });
  pi.registerProvider('delivery-fixture',{
@@ -56,12 +66,13 @@ export default function(pi) {
     else if(spec?.name) calls=[{name:spec.name,args:spec.args}];
     else if(spec?.worker && spec.gate) calls=[{name:'fixture_gate',args:{gate:spec.gate}}];
     else if(last?.role==='user' && prompt.includes('Subagent results are ready.')) calls=[{name:'wait_for_subagents',args:{}}];
-    if(calls) {
+    const summarizing=context.messages.some(m=>m.role==='system' && (text(m)??'').includes('You are a context summarization assistant.'));
+    if(calls && !summarizing) {
      output.stopReason='toolUse';output.content=calls.map(c=>({type:'toolCall',id:'delivery-'+(++sequence),name:c.name,arguments:c.args}));
      output.content.forEach((toolCall,contentIndex)=>{stream.push({type:'toolcall_start',contentIndex,partial:output});stream.push({type:'toolcall_end',contentIndex,toolCall,partial:output});});
     } else {
      const users=context.messages.filter(m=>m.role==='user').map(text);
-     const task=users.find(p=>p?.includes('"worker"'));
+     const task=users.filter(p=>p?.startsWith('{"worker"')).at(-1);
      const value=spec?.worker?'Report '+spec.worker:task?'Report '+JSON.parse(task).worker:'Final handoff';
      output.content=[{type:'text',text:value}];
      stream.push({type:'text_start',contentIndex:0,partial:output});stream.push({type:'text_delta',contentIndex:0,delta:value,partial:output});stream.push({type:'text_end',contentIndex:0,content:value,partial:output});
@@ -111,8 +122,13 @@ export async function parent(existing?: { cwd: string; session: string }) {
   const entries = async () => (await rpc.send({ type: "get_entries" })).data.entries as RecordValue[];
   const gateStarted = (gate: string) => eventually(() => existsSync(join(cwd, gate + ".started")), gate);
   const release = (gate: string) => writeFileSync(join(cwd, gate), "released");
-  const collected = (id: string, attempt = 1) => eventually(() => rows.some(row => row.type === "tool_execution_end" &&
-    row.toolName === "wait_for_subagents" && row.result.details?.reports?.some((report: RecordValue) => report.id === id && report.attempt === attempt)), `collection ${id}/${attempt}`);
+  const collected = async (id: string, attempt = 1) => {
+    const matches = (row: RecordValue) => row.type === "tool_execution_end" && row.toolName === "wait_for_subagents" &&
+      row.result.details?.reports?.some((report: RecordValue) => report.id === id && report.attempt === attempt);
+    await eventually(() => rows.some(matches), `collection ${id}/${attempt}`);
+    const index = rows.findIndex(matches);
+    await eventually(() => rows.slice(index + 1).some(row => row.type === "agent_settled"), "collection settlement");
+  };
   const command = (message: string) => rpc.send({ type: "prompt", message });
   return { cwd, rpc, rows, session, call, launch, snapshot, entries, gateStarted, release, collected, command };
 }
@@ -122,6 +138,16 @@ export function receipts(entries: RecordValue[]) {
   return entries.filter(entry => entry.customType === "pi-rpc-subagent-delivery" && committed.has(entry.data.callId))
     .flatMap(entry => entry.data.reports.map((report: RecordValue) => `${report.id}/${report.attempt}`));
 }
+export async function verifyUsage(p: Awaited<ReturnType<typeof parent>>, expected: number) {
+  const entries = await p.entries();
+  assert.equal(childUsage(entries), expected);
+  const stats = (await p.rpc.send({ type: "get_session_stats" })).data;
+  const own = entries.reduce((sum, entry) => sum + (entry.message?.role === "assistant" ? entry.message.usage.totalTokens : entry.usage?.totalTokens ?? 0), 0);
+  assert.equal(stats.tokens.input + stats.tokens.output + stats.tokens.cacheRead + stats.tokens.cacheWrite, own + expected);
+  const costs = entries.reduce((sum, entry) => sum + (entry.message?.usage?.cost?.total ?? entry.usage?.cost?.total ?? 0), 0);
+  assert(Math.abs(stats.cost - costs) < 1e-8);
+}
+
 export function childUsage(entries: RecordValue[]) {
   return entries.filter(entry => entry.message?.role === "toolResult").reduce((sum, entry) => sum + (entry.message.usage?.totalTokens ?? 0), 0);
 }

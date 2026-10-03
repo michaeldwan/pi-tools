@@ -48,12 +48,16 @@ export default function subagents(pi: ExtensionAPI) {
   let registry: Registry | undefined;
   let delivery: Delivery | undefined;
   let quitting = false;
-  registerSubagentsUI(pi, () => registry);
+  registerSubagentsUI(pi, () => registry, action => {
+    if (!delivery) throw new Error("Parent worker registry isn't available");
+    if (action === "pause") delivery.pause(); else delivery.resume();
+  });
   pi.on("session_start", (event, ctx) => {
     quitting = false;
     const opened = Registry.open(getAgentDir(), ctx.sessionManager.getSessionId(), piInvocation(), ctx.sessionManager.getSessionFile());
     registry = opened.registry;
     delivery = new Delivery(pi, registry, ctx, event.reason === "reload" && opened.live);
+    delivery.observeSignal(ctx.signal);
     registry.changed = () => {
       const active = [...registry!.workers.values()].filter(item => !item.terminal).length;
       ctx.ui.setStatus("pi-rpc-subagents", active ? `${active} worker${active === 1 ? "" : "s"} active` : undefined);
@@ -61,6 +65,8 @@ export default function subagents(pi: ExtensionAPI) {
     };
     registry.changed([...registry.workers.values()][0]);
   });
+  pi.on("input", event => { if (event.source !== "extension") delivery?.input(); });
+  pi.on("turn_start", (_event, ctx) => delivery?.observeSignal(ctx.signal));
   pi.on("turn_end", event => delivery?.boundary(event.outcome));
   pi.on("agent_before_settle", event => delivery?.boundary(event.outcome));
   pi.on("agent_settled", () => delivery?.wake());
@@ -148,16 +154,21 @@ export default function subagents(pi: ExtensionAPI) {
   });
   pi.registerTool({
     name: "wait_for_subagents", label: "Wait for subagents", exposure: "model-only",
-    description: "Collect available unhandled worker reports once after a result-ready notification. Don't poll.",
+    description: "Collect unhandled reports now, or quietly end this run while workers remain live. New results resume the idle parent automatically. " +
+      "Continue independent work first; don't poll, read worker transcripts to wait, or emit waiting/acknowledgment-only replies. " +
+      "Parent input remains available. Explicit /subagents pause suppresses automatic processing until /subagents resume; idle Esc doesn't pause arrivals.",
     parameters: Type.Object({}),
-    outputSchema: Type.Object({ reports: Type.Array(resultSchema) }),
+    outputSchema: Type.Object({ reports: Type.Array(resultSchema), waiting: Type.Boolean(), paused: Type.Boolean() }),
     async execute(callId) {
-      if (!delivery) throw new Error("Parent worker registry isn't available");
-      const reports = delivery.pending();
+      if (!delivery || !registry) throw new Error("Parent worker registry isn't available");
+      const reports = delivery.paused ? [] : delivery.pending();
       const usage = delivery.reserve(reports, callId);
-      const data = { reports };
-      return { content: [{ type: "text" as const, text: reports.length ? reports.map(resultText).join("\n\n") : "No unhandled reports." }],
-        details: data, structuredContent: data, usage };
+      const waiting = !reports.length && [...registry.workers.values()].some(worker => !worker.terminal);
+      const data = { reports, waiting, paused: delivery.paused };
+      return { content: [{ type: "text" as const, text: reports.length ? reports.map(resultText).join("\n\n") :
+        delivery.paused ? "Automatic results are paused. Use /subagents resume; explicit get_subagent_result remains available." :
+        waiting ? "Quietly waiting for workers. Parent input remains available; results resume processing automatically." : "No live workers or unhandled reports." }],
+        details: data, structuredContent: data, usage, terminate: !reports.length && (waiting || delivery.paused) };
     },
   });
   pi.registerTool({
