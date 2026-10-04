@@ -31,7 +31,14 @@ export default function guard(pi: ExtensionAPI) {
       try {
         await assertSessionAvailable(config.leasePath);
         if (existsSync(config.leasePath)) unlinkSync(config.leasePath);
-        lease = createServer((socket) => socket.end());
+        lease = createServer((socket) => {
+          // Let the client close after observing connect. Immediate EOF can
+          // appear as ECONNREFUSED in the standalone host before connect fires.
+          socket.on("error", () => socket.destroy());
+          socket.setTimeout(5000, () => socket.destroy());
+          socket.unref();
+          socket.resume();
+        });
         await new Promise<void>((resolve, reject) => {
           lease!.once("error", reject);
           lease!.listen(config.leasePath, resolve);

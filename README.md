@@ -35,13 +35,21 @@ pnpm run check
 
 Tests run isolated Pi instances with deterministic providers. They don't need credentials and don't use your real agent directory. Development types are pinned to Pi 1.0.0.
 
-`test/subagents/host.test.ts` probes quiet tool termination, hidden ready notifications, child usage collection and idle abort visibility. Run it against an installed host without changing your settings:
+`test/subagents/host.test.ts` probes quiet tool termination, hidden ready notifications, child usage collection and idle abort visibility. Every real-host test honors `PI_TEST_HOST`, including shutdown, cancellation, restart and one-shot reviews. Run the full checks against your installed Pi without changing its settings:
 
 ```sh
-PI_TEST_HOST=/absolute/path/to/pi node --experimental-strip-types --test test/subagents/host.test.ts
+pnpm run check:host
 ```
 
-Background results prompt one collection call automatically; `wait_for_subagents` quietly yields when workers are still busy. `/subagents pause` and `/subagents resume` control automatic processing without stopping workers. Pause persists across reload/restart and isn't undone by ordinary input.
+Or select an exact binary:
+
+```sh
+PI_TEST_HOST=/absolute/path/to/pi pnpm run check
+```
+
+Background results prompt one collection call automatically. In interactive and RPC sessions, `wait_for_subagents` quietly yields when workers are still busy. Print and JSON runs wait for reports instead, and final settlement waits for remaining workers before the process exits. Background launch stays asynchronous in every mode -- no prompt changes are needed.
+
+`/subagents pause` and `/subagents resume` control automatic processing without stopping workers. Pause persists across reload/restart and isn't undone by ordinary input.
 
 The host probes retain evidence of a Pi 1.0.0 limitation: idle Esc/RPC abort isn't observable through public extension events or abort signals. It doesn't pause arrivals -- use `/subagents pause`. Tests in `delivery.test.ts` and `waiting.test.ts` exercise the implemented delivery, recovery, accounting and pause controls through real RPC. Set `PI_TEST_HOST` to run them against an installed host too.
 

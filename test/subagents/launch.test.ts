@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { discoverAgents, resolveModel, toolList } from "../../extensions/subagents/agents.ts";
 import { childConfigKey } from "../../extensions/subagents/guard.ts";
 import { JsonLines, RpcProcess } from "../../extensions/subagents/rpc.ts";
 import { preflight, runWorker, workerLeasePath } from "../../extensions/subagents/worker.ts";
+import { hostInvocation } from "./fixture-invocation.ts";
 
 function isolated() {
   const cwd = mkdtempSync(join(tmpdir(), "pi-rpc-test-"));
@@ -124,6 +125,31 @@ if(c.type==='prompt' && c.message==='/pi-rpc-worker-inspect') {
   } finally { await rpc.close(); }
 });
 
+test("capability timeout preserves the confirmed refusal when the wall clock moves back", async () => {
+  const f = fake(`
+if(c.type==='prompt' && c.message==='/pi-rpc-worker-inspect') {
+ if(!process.inspected) {
+  process.inspected=true;
+  emit({type:'extension_ui_request',method:'notify',message:'pi-rpc-worker:'+JSON.stringify({cwd:process.cwd(),callable:[]})});
+  response(c,{disposition:'handled'});
+ }
+} else { ${workerProtocol} }
+`);
+  const rpc = new RpcProcess(f.invocation, f.cwd, [], f.env);
+  const now = Date.now;
+  const inspect = rpc.inspect.bind(rpc);
+  let polls = 0;
+  rpc.inspect = (timeoutMs) => {
+    if (++polls === 2) Date.now = () => now() - 1000;
+    return inspect(timeoutMs);
+  };
+  try {
+    await assert.rejects(preflight(rpc, f.cwd, ["mcp__missing__show"], 1000),
+      /required tools unavailable.*mcp__missing__show[\s\S]*No task prompt was sent/);
+    assert.equal(polls, 2);
+  } finally { Date.now = now; await rpc.close(); }
+});
+
 test("worker returns settlement evidence and usage, not process exit success", async () => {
   const f = fake(workerProtocol);
   const result = await runWorker({ ...f, task: "work", agent: { name: "test", prompt: "" },
@@ -208,8 +234,7 @@ export default function(pi) {
     }
   });
 }`);
-  const cliPath = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
-  const result = await runWorker({ ...f, invocation: { command: process.execPath, args: [cliPath] },
+  const result = await runWorker({ ...f, invocation: hostInvocation(),
     task: "Check the MCP fixture", agent: { name: "test", prompt: "" }, model: "fixture/mcp", thinking: "high",
     approveProject: true, tools: ["codemode", "mcp__fixture__inspect"],
     requiredTools: ["codemode", "mcp__fixture__inspect"] });
@@ -233,8 +258,7 @@ test("real pi loads local package and keeps ordinary project resources", async (
     pi.registerCommand('project-resource', {handler:async()=>{}});
     pi.registerTool({name:'subagent',label:'fixture',description:'fixture',parameters:{type:'object',properties:{}},execute:async()=>({content:[],details:undefined})});
   }`);
-  const cliPath = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
-  const rpc = new RpcProcess({ command: process.execPath, args: [cliPath] }, f.cwd,
+  const rpc = new RpcProcess(hostInvocation(), f.cwd,
     ["--approve", "--no-session", "--extension", fileURLToPath(new URL("../..", import.meta.url)),
       "--extension", fileURLToPath(new URL("../../extensions/subagents/guard.ts", import.meta.url))],
     { ...f.env, [childConfigKey]: JSON.stringify({ tools: ["read", "codemode"] }) });

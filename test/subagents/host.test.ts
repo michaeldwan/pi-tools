@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { RpcProcess, type RecordValue } from "../../extensions/subagents/rpc.ts";
+import { hostInvocation } from "./fixture-invocation.ts";
 
 // This probes host capabilities independently of the subagent implementation.
 // It uses only public extension APIs and an isolated deterministic provider.
@@ -63,8 +63,7 @@ async function probe() {
   writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ cacheWarming: "off", defaultTools: ["+codemode"] }));
   const extension = join(cwd, "probe.ts");
   writeFileSync(extension, fixture);
-  const cli = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
-  const invocation = process.env.PI_TEST_HOST ? { command: process.env.PI_TEST_HOST, args: [] } : { command: process.execPath, args: [cli] };
+  const invocation = hostInvocation();
   const rows: RecordValue[] = [];
   const rpc = new RpcProcess(invocation, cwd,
     ["--model", "host-probe/model", "--thinking", "off", "--extension", extension, "--session-dir", join(cwd, "sessions")],

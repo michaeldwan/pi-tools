@@ -82,7 +82,7 @@ export default function subagents(pi: ExtensionAPI) {
   pi.on("turn_start", (_event, ctx) => delivery?.observeSignal(ctx.signal));
   pi.on("tool_call", event => { delivery?.trackCall(event.toolCallId, event.parentToolCallId); });
   pi.on("turn_end", event => delivery?.boundary(event.outcome));
-  pi.on("agent_before_settle", event => delivery?.boundary(event.outcome));
+  pi.on("agent_before_settle", (event, ctx) => delivery?.beforeSettle(event.outcome, ctx.signal));
   pi.on("agent_settled", () => delivery?.wake());
   const lookup = (id: string) => {
     const worker = registry?.workers.get(id);
@@ -176,13 +176,14 @@ export default function subagents(pi: ExtensionAPI) {
   });
   pi.registerTool({
     name: "wait_for_subagents", label: "Wait for subagents", exposure: "model-only",
-    description: "Collect unhandled reports now, or quietly end this run while workers remain live. New results resume the idle parent automatically. " +
+    description: "Collect unhandled reports now, or quietly wait while workers remain live. Persistent sessions yield and resume automatically; print/JSON runs stay open until reports arrive. " +
       "Continue independent work first; don't poll, read worker transcripts to wait, or emit waiting/acknowledgment-only replies. " +
       "Parent input remains available. Explicit /subagents pause suppresses automatic processing until /subagents resume; idle Esc doesn't pause arrivals.",
     parameters: Type.Object({}),
     outputSchema: Type.Object({ reports: Type.Array(resultSchema), waiting: Type.Boolean(), paused: Type.Boolean() }),
-    async execute(callId) {
+    async execute(callId, _params, signal) {
       if (!delivery || !registry) throw new Error("Parent worker registry isn't available");
+      await delivery.waitForWorkers(signal);
       const reports = delivery.paused ? [] : delivery.pending();
       const usage = delivery.reserve(reports, callId);
       const waiting = !reports.length && [...registry.workers.values()].some(worker => !worker.terminal);

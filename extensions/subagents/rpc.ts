@@ -9,17 +9,19 @@ import { createConnection } from "node:net";
 export async function assertSessionAvailable(path: string) {
   await new Promise<void>((resolve, reject) => {
     const socket = createConnection(path);
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error); else resolve();
+      socket.destroy();
+    };
     socket.setTimeout(1000);
-    socket.once("connect", () => {
-      socket.destroy();
-      reject(new Error("A previous child still owns this worker session. Retry resume after it exits."));
-    });
+    socket.once("connect", () => finish(new Error("A previous child still owns this worker session. Retry resume after it exits.")));
     socket.once("error", (error: NodeJS.ErrnoException) => {
-      socket.destroy();
-      if (["ENOENT", "ECONNREFUSED"].includes(error.code ?? "")) resolve();
-      else reject(error);
+      finish(["ENOENT", "ECONNREFUSED"].includes(error.code ?? "") ? undefined : error);
     });
-    socket.once("timeout", () => { socket.destroy(); reject(new Error("Worker session ownership check timed out; refusing resume")); });
+    socket.once("timeout", () => finish(new Error("Worker session ownership check timed out; refusing resume")));
   });
 }
 
@@ -67,12 +69,19 @@ export class RpcProcess {
   private failure?: Error;
   private stderr = "";
   private closed: Promise<void>;
+  private exited: Promise<void>;
+  private didClose = false;
+  private didExit = false;
+  private spawned = false;
   private closing?: Promise<void>;
 
   constructor(invocation: Invocation, cwd: string, args: string[], env: NodeJS.ProcessEnv,
     record: (row: RecordValue) => void = () => {}) {
     this.child = spawn(invocation.command, [...invocation.args, "--mode", "rpc", ...args], {
       cwd, env, stdio: ["pipe", "pipe", "pipe"], shell: false,
+      // A separate group lets us signal descendants that inherited RPC pipes,
+      // without touching the caller's process group.
+      detached: process.platform !== "win32",
     });
     const reader = new JsonLines((row) => {
       record(row);
@@ -95,9 +104,19 @@ export class RpcProcess {
       record({ type: "stderr", text: chunk.toString() });
       this.stderr = (this.stderr + chunk.toString()).slice(-8192);
     });
+    this.child.once("spawn", () => { this.spawned = true; });
     this.child.on("error", (error) => this.fail(error));
     this.child.stdin.on("error", (error) => this.fail(error));
+    this.exited = new Promise((resolve) => {
+      this.child.once("exit", (code, signal) => {
+        this.didExit = true;
+        this.fail(new Error(`Pi RPC exited (code=${code}, signal=${signal}). ${this.stderr}`));
+        resolve();
+      });
+      this.child.once("error", () => { if (!this.spawned) resolve(); });
+    });
     this.closed = new Promise((resolve) => this.child.once("close", (code, signal) => {
+      this.didClose = true;
       this.fail(new Error(`Pi RPC exited (code=${code}, signal=${signal}). ${this.stderr}`));
       resolve();
     }));
@@ -118,6 +137,7 @@ export class RpcProcess {
 
   async send(command: RecordValue, timeoutMs = 30_000): Promise<RecordValue> {
     if (this.failure) throw this.failure;
+    if (this.closing) throw new Error("Pi RPC is closing; refusing new commands");
     const id = `worker-${++this.sequence}`;
     let timer: NodeJS.Timeout | undefined;
     try {
@@ -169,7 +189,7 @@ export class RpcProcess {
       });
     });
     // Attach a rejection handler before the command response can fail.
-    const acceptance = this.send({ type: "prompt", message: task }).then((response) => {
+    const acceptance = this.send({ type: "prompt", message: task }, Math.min(30_000, timeoutMs)).then((response) => {
       if (response.data?.disposition === "handled") handled();
     });
     try { await Promise.all([acceptance, settled]); }
@@ -190,12 +210,56 @@ export class RpcProcess {
     return this.closing ??= this.shutdown();
   }
 
+  private async waitFor(promise: Promise<void>, timeoutMs: number): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([promise, new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); })]);
+    } finally { clearTimeout(timer); }
+  }
+
+  private signal(signal: NodeJS.Signals) {
+    if (!this.spawned || !this.child.pid) return;
+    try {
+      if (process.platform === "win32") {
+        if (!this.didExit) this.child.kill(signal);
+      } else process.kill(-this.child.pid, signal);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+        this.fail(new Error(`Pi RPC ${signal} failed: ${String(error)}. ${this.stderr}`));
+      }
+    }
+  }
+
   private async shutdown(): Promise<void> {
-    if (this.child.exitCode !== null || this.child.signalCode !== null) return this.closed;
+    if (this.didClose) return;
+    const started = Date.now();
     this.child.stdin.end();
-    const term = setTimeout(() => this.child.kill("SIGTERM"), 1500);
-    const kill = setTimeout(() => this.child.kill("SIGKILL"), 5000);
-    try { await this.closed; }
-    finally { clearTimeout(term); clearTimeout(kill); }
+    // exit tracks the direct process; close also waits for inherited pipes.
+    // Neither pipe lifetime nor a failed kill may hold cleanup indefinitely.
+    await this.waitFor(this.exited, 1500);
+    if (!this.didClose) {
+      this.signal("SIGTERM");
+      await this.waitFor(this.closed, Math.max(0, 5000 - (Date.now() - started)));
+    }
+    if (!this.didClose) {
+      this.signal("SIGKILL");
+      await this.waitFor(this.closed, 1000);
+    }
+    if (!this.didClose) {
+      const diagnostic = `Pi RPC shutdown left open pipes; closing transport (pid=${this.child.pid}, exited=${this.didExit}). ${this.stderr}`;
+      this.fail(new Error(diagnostic));
+      for (const listener of this.listeners) listener({ type: "shutdown_error", error: diagnostic });
+      this.child.stdin.destroy();
+      this.child.stdout.destroy();
+      this.child.stderr.destroy();
+      await this.waitFor(this.closed, 100);
+      if (this.spawned && !this.didExit) {
+        throw new Error(`Pi RPC shutdown did not terminate process ${this.child.pid}. ${this.stderr}`);
+      }
+      throw new Error(diagnostic);
+    }
+    if (this.spawned && !this.didExit) {
+      throw new Error(`Pi RPC shutdown did not terminate process ${this.child.pid}. ${this.stderr}`);
+    }
   }
 }

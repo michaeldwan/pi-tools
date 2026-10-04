@@ -28,8 +28,9 @@
   "packageManager": "pnpm@11.17.0",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test test/*/*.test.ts",
-    "check": "pnpm run typecheck && pnpm run test"
+    "test": "node --experimental-strip-types --test --test-timeout=180000 test/*/*.test.ts",
+    "check": "pnpm run typecheck && pnpm run test",
+    "check:host": "PI_TEST_HOST=\"$(command -v pi)\" && export PI_TEST_HOST && pnpm run check"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

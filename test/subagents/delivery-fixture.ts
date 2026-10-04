@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { RpcProcess, type RecordValue } from "../../extensions/subagents/rpc.ts";
+import { hostInvocation } from "./fixture-invocation.ts";
 
-const provider = `
+export const provider = `
 import {createAssistantMessageEventStream} from '@earendil-works/pi-ai';
 import {Type} from 'typebox';
 import {existsSync,watch,writeFileSync,appendFileSync,unlinkSync} from 'node:fs';
@@ -71,6 +72,8 @@ export default function(pi) {
     if(spec?.calls) calls=spec.calls;
     else if(spec?.name) calls=[{name:spec.name,args:spec.args}];
     else if(spec?.worker && spec.gate) calls=[{name:'fixture_gate',args:{gate:spec.gate}}];
+    else if(last?.role==='toolResult' && ['subagent','codemode'].includes(last.toolName) &&
+      context.messages.some(m=>m.role==='user' && (text(m)??'').includes('"waitAfterLaunch":true'))) calls=[{name:'wait_for_subagents',args:{}}];
     else if(last?.role==='user' && prompt.includes('Subagent results are ready.')) calls=[{name:'wait_for_subagents',args:{}}];
     const summarizing=context.messages.some(m=>m.role==='system' && (text(m)??'').includes('You are a context summarization assistant.'));
     if(calls && !summarizing) {
@@ -108,9 +111,8 @@ export async function parent(existing?: { cwd: string; session: string }) {
   mkdirSync(agentDir, { recursive: true });
   writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ cacheWarming: "off", defaultTools: ["+codemode"], compaction: { keepRecentTokens: 0 } }));
   writeFileSync(join(cwd, ".pi", "extensions", "provider.ts"), provider);
-  const cli = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
   const rows: RecordValue[] = [];
-  const invocation = process.env.PI_TEST_HOST ? { command: process.env.PI_TEST_HOST, args: [] } : { command: process.execPath, args: [cli] };
+  const invocation = hostInvocation();
   const rpc = new RpcProcess(invocation, cwd,
     ["--approve", "--model", "delivery-fixture/model", "--thinking", "off", "--extension", fileURLToPath(new URL("../..", import.meta.url)),
       "--session-dir", join(cwd, "sessions"), ...(existing ? ["--session", existing.session] : [])],

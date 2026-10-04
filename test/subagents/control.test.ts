@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { RpcProcess, type RecordValue } from "../../extensions/subagents/rpc.ts";
 import { Worker } from "../../extensions/subagents/worker.ts";
+import { hostInvocation } from "./fixture-invocation.ts";
 
 // Runs the registered tools through Pi's real model/tool/event pipeline. Only
 // the provider is deterministic; the worker CLI, steering, bash and abort are real.
@@ -99,13 +100,13 @@ async function parent(existing?: { cwd: string; session: string }) {
       }
     }); }
   `);
-  const cli = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
   const rows: RecordValue[] = [];
-  const rpc = new RpcProcess({ command: process.execPath, args: [cli] }, cwd,
+  const rpc = new RpcProcess(hostInvocation(), cwd,
     ["--approve", "--model", "fixture/control", "--thinking", "high", "--extension", fileURLToPath(new URL("../..", import.meta.url)),
       "--session-dir", join(cwd, "sessions"), ...(existing ? ["--session", existing.session] : [])],
     { ...process.env, PI_RPC_SUBAGENT_CHILD: "", PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" }, (row) => rows.push(row));
-  await rpc.send({ type: "get_state" });
+  try { await rpc.send({ type: "get_state" }); }
+  catch (error) { await rpc.close(); throw error; }
   async function call(name: string, args: RecordValue) {
     const start = rows.length;
     let timer: NodeJS.Timeout | undefined;

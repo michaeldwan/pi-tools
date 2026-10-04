@@ -36,9 +36,9 @@ export async function preflight(rpc: RpcProcess, cwd: string, required: string[]
     try {
       snapshot = await rpc.inspect(Math.max(1, deadline - Date.now()));
     } catch (error) {
-      // A final poll can time out at the capability deadline. Preserve the
-      // missing-tools diagnostic from the previous successful inspection.
-      if (snapshot && Date.now() >= deadline && error instanceof Error && error.message.startsWith("Pi RPC prompt timed out")) break;
+      // The RPC timeout ends the final poll. Keep the confirmed missing-tools
+      // diagnostic even if the wall clock moved before its timer fired.
+      if (snapshot && error instanceof Error && error.message.startsWith("Pi RPC prompt timed out")) break;
       throw error;
     }
     if (realpathSync(snapshot.cwd) !== realpathSync(cwd)) throw new Error(`Pi worker cwd mismatch: ${snapshot.cwd}, expected ${cwd}`);
@@ -195,6 +195,7 @@ export class Worker {
     delete this.result.stats;
     delete this.result.pid;
     this.assistant = undefined;
+    this.rpc = undefined;
     this.stopped = undefined;
     this.stopping = undefined;
     this.controller = new AbortController();
@@ -286,7 +287,7 @@ export class Worker {
         if (this.result.status === "running") {
           try { await this.rpc.cancel(); } catch { /* close escalates if RPC is stalled */ }
         }
-        await this.rpc.close();
+        try { await this.rpc.close(); } catch { /* execute records shutdown failures */ }
       }
       await this.done;
     })();
@@ -304,6 +305,7 @@ export class Worker {
       if (options.signal?.aborted) abort();
       this.controller.signal.throwIfAborted();
       if (session) await assertSessionAvailable(options.leasePath!);
+      this.controller.signal.throwIfAborted();
       const args = ["--model", options.model, "--thinking", options.thinking,
         "--session-dir", join(this.directory, "sessions"),
         "--extension", fileURLToPath(new URL("./guard.ts", import.meta.url)),
@@ -359,10 +361,18 @@ export class Worker {
       this.result.stopReason = this.assistant?.stopReason;
       this.result.error = bounded(this.stopped ?? `Pi worker ${stage} failed: ${error instanceof Error ? error.message : String(error)}. Check the transcript and model/provider configuration.`);
     } finally {
-      await this.rpc?.close();
+      let shutdownError: string | undefined;
+      try { await this.rpc?.close(); }
+      catch (error) {
+        shutdownError = `Pi worker shutdown failed: ${error instanceof Error ? error.message : String(error)}`;
+        outcome = "failed";
+        this.record({ type: "shutdown_error", error: shutdownError });
+      }
       options.signal?.removeEventListener("abort", abort);
       this.result.status = this.stopped ? (this.stopped.startsWith("Parent session ") ? "interrupted" : "stopped") : outcome;
+      if (shutdownError) this.result.status = "failed";
       if (this.stopped) this.result.error = this.stopped;
+      if (shutdownError) this.result.error = bounded([this.result.error, shutdownError].filter(Boolean).join("\n"));
       this.record({ type: "worker_result", result: this.result });
       this.save();
       this.changed(this);

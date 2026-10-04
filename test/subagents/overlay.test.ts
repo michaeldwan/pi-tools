@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { RpcProcess } from "../../extensions/subagents/rpc.ts";
+import { hostInvocation } from "./fixture-invocation.ts";
 import { activityText, registerSubagentsUI, SubagentsOverlay } from "../../extensions/subagents/overlay.ts";
 
 const theme = { fg: (_color: string, value: string) => value } as Theme;
@@ -738,9 +739,8 @@ test("command and shortcut share one TUI-only interaction; shutdown/reload dispo
 
 test("real pi RPC handles /subagents without a custom UI or model call", async () => {
   const directory = mkdtempSync(join(tmpdir(), "pi-overlay-rpc-"));
-  const cli = fileURLToPath(new URL("./cli.js", import.meta.resolve("@earendil-works/pi-coding-agent")));
   const records: Record<string, any>[] = [];
-  const rpc = new RpcProcess({ command: process.execPath, args: [cli] }, directory,
+  const rpc = new RpcProcess(hostInvocation(), directory,
     ["--no-session", "--extension", fileURLToPath(new URL("../..", import.meta.url))],
     { ...process.env, PI_RPC_SUBAGENT_CHILD: "", PI_CODING_AGENT_DIR: directory, PI_OFFLINE: "1" }, (row) => records.push(row));
   try {
@@ -793,8 +793,7 @@ export default function(pi) {
    return stream;
   }});
 }`);
-  const cli = fileURLToPath(new URL("./cli.js", import.meta.resolve("@earendil-works/pi-coding-agent")));
-  const invocation = { command: process.execPath, args: [cli] };
+  const invocation = hostInvocation();
   const registry = Registry.open(agentDir, "ticking-parent", invocation).registry;
   const child = new Worker({ cwd: directory, directory: registry.newDirectory(), task: "ticking request",
     agent: { name: "general-purpose", prompt: "" }, model: "fixture/ticking", thinking: "high", invocation,
@@ -905,8 +904,7 @@ export default function(pi) {
    return stream;
   }});
 }`);
-  const cli = fileURLToPath(new URL("./cli.js", import.meta.resolve("@earendil-works/pi-coding-agent")));
-  const invocation = { command: process.execPath, args: [cli] };
+  const invocation = hostInvocation();
   const registry = Registry.open(agentDir, "focus-parent", invocation).registry;
   const worker = new Worker({ cwd: directory, directory: registry.newDirectory(), task: "initial request",
     agent: { name: "Explore", prompt: "" }, model: "fixture/focus", thinking: "high", invocation,

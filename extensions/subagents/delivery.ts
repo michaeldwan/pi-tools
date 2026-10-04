@@ -53,6 +53,7 @@ export class Delivery {
     this.refresh();
   }
   get paused() { return this.registry.deliveryState.paused; }
+  private get oneShot() { return this.ctx.mode === "print" || this.ctx.mode === "json"; }
   private get state() { return this.registry.deliveryState; }
   detach() { this.detached = true; this.signal?.removeEventListener("abort", this.aborted); }
   observeSignal(signal?: AbortSignal) {
@@ -164,8 +165,32 @@ export class Delivery {
     const notice = this.notice();
     return notice ? { entries: [{ type: "custom_message", ...notice } satisfies SessionBoundaryDraft], continue: true } : undefined;
   }
+  async waitForWorkers(signal?: AbortSignal, all = false) {
+    if (!this.oneShot) return;
+    while (!this.detached && !this.state.canceled) {
+      signal?.throwIfAborted();
+      if (!all && !this.paused && this.pending().length) return;
+      const active = [...this.registry.workers.values()].filter(worker => !worker.terminal);
+      if (!active.length) return;
+      let abort = () => {};
+      const canceled = new Promise<never>((_resolve, reject) => {
+        abort = () => reject(signal?.reason ?? new Error("Subagent wait aborted"));
+        signal?.addEventListener("abort", abort, { once: true });
+      });
+      try {
+        await Promise.race([all ? Promise.all(active.map(worker => worker.done)) : Promise.race(active.map(worker => worker.done)), canceled]);
+      } finally { signal?.removeEventListener("abort", abort); }
+    }
+  }
+  async beforeSettle(outcome: string, signal?: AbortSignal) {
+    if (outcome !== "aborted") {
+      try { await this.waitForWorkers(signal, true); }
+      catch (error) { if (!signal?.aborted) throw error; this.cancel(); }
+    }
+    return this.boundary(outcome);
+  }
   wake() {
-    if (this.detached || this.paused || this.state.canceled || !this.ctx.isIdle()) return;
+    if (this.oneShot || this.detached || this.paused || this.state.canceled || !this.ctx.isIdle()) return;
     const notice = this.notice();
     if (notice) this.pi.sendMessage(notice, { triggerTurn: true });
   }
